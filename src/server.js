@@ -8,6 +8,16 @@ const { generateVideo } = require("./videoGenerator");
 const { generateScreenshot } = require("./screenshotGenerator");
 const { generatePdf } = require("./pdfGenerator");
 const { generatePresentation } = require("./presentationGenerator");
+const { generateScenePlan } = require("./aiScript");
+const { fetchPageOutline } = require("./pageOutline");
+const {
+  applyEmotionDirection,
+  scenesToScript,
+  scriptToScenes,
+  EMOTION_STYLE_IDS,
+  EMOTION_TAGS,
+} = require("./emotionDirector");
+const { synthesizeBuffer } = require("./fishAudio");
 
 const ALLOWED_DEVICES = new Set(["desktop", "mobile"]);
 const ALLOWED_RATIOS = new Set(["vertical", "square", "horizontal"]);
@@ -41,6 +51,7 @@ const ALLOWED_ORIENTATIONS = new Set(["portrait", "landscape"]);
 const ALLOWED_MARGINS = new Set(["none", "small", "normal", "large"]);
 const ALLOWED_LANGUAGES = new Set(["en", "ms"]);
 const ALLOWED_TONES = new Set(["professional", "friendly", "premium"]);
+const ALLOWED_EMOTION_STYLES = new Set(EMOTION_STYLE_IDS);
 
 function bad(res, code, message) {
   return res.status(code).json({ error: "invalid_request", message });
@@ -65,6 +76,79 @@ async function main() {
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true, uptime: process.uptime() });
+  });
+
+  // --- AI Emotion Director: script generation + voice preview ---
+
+  app.post("/api/presentations/script", async (req, res) => {
+    try {
+      const body = req.body || {};
+      const device = String(body.device || "desktop");
+      const language = String(body.language || "en");
+      const tone = String(body.tone || "professional");
+      const emotionStyle = String(body.emotionStyle || "auto");
+      const changes = String(body.changes || "").trim();
+
+      if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
+      if (!ALLOWED_LANGUAGES.has(language)) return bad(res, 400, "Invalid language.");
+      if (!ALLOWED_TONES.has(tone)) return bad(res, 400, "Invalid tone.");
+      if (!ALLOWED_EMOTION_STYLES.has(emotionStyle))
+        return bad(res, 400, "Invalid emotionStyle.");
+      if (changes.length < 10 || changes.length > 4000)
+        return bad(res, 400, "Please describe the website changes (10-4000 characters).");
+
+      let websiteUrl;
+      try {
+        websiteUrl = await validateAndNormalizeUrl(body.websiteUrl);
+      } catch (err) {
+        return bad(res, 400, err.message);
+      }
+
+      // Reuse a previous website analysis when regenerating the script.
+      const pageOutline =
+        Array.isArray(body.pageOutline) && body.pageOutline.length
+          ? body.pageOutline.slice(0, 120).map((s) => String(s).slice(0, 160))
+          : await fetchPageOutline({ websiteUrl, device });
+
+      const plan = await generateScenePlan({
+        websiteUrl,
+        changes,
+        language,
+        tone,
+        pageOutline,
+      });
+      const scenes = await applyEmotionDirection({
+        scenes: plan.scenes,
+        emotionStyle,
+        language,
+        changes,
+      });
+
+      res.json({
+        pageOutline,
+        scenes,
+        script: scenesToScript(scenes),
+        emotionTags: EMOTION_TAGS,
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "server_error", message: err.message });
+    }
+  });
+
+  app.post("/api/presentations/voice-preview", async (req, res) => {
+    try {
+      const text = String((req.body || {}).text || "").trim();
+      if (text.length < 2 || text.length > 1200)
+        return bad(res, 400, "Preview text must be 2-1200 characters.");
+      const buffer = await synthesizeBuffer({ text });
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Length", String(buffer.length));
+      res.send(buffer);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "server_error", message: err.message });
+    }
   });
 
   app.post("/api/jobs", async (req, res) => {
@@ -210,12 +294,14 @@ async function main() {
       const device = String(body.device || "desktop");
       const language = String(body.language || "en");
       const tone = String(body.tone || "professional");
-      const voiceId = body.voiceId ? String(body.voiceId).slice(0, 120) : "";
+      const emotionStyle = String(body.emotionStyle || "auto");
       const changes = String(body.changes || "").trim();
 
       if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
       if (!ALLOWED_LANGUAGES.has(language)) return bad(res, 400, "Invalid language.");
       if (!ALLOWED_TONES.has(tone)) return bad(res, 400, "Invalid tone.");
+      if (!ALLOWED_EMOTION_STYLES.has(emotionStyle))
+        return bad(res, 400, "Invalid emotionStyle.");
       if (changes.length < 10 || changes.length > 4000)
         return bad(res, 400, "Please describe the website changes (10-4000 characters).");
 
@@ -226,14 +312,24 @@ async function main() {
         return bad(res, 400, err.message);
       }
 
+      // An edited/approved emotion script skips the AI scripting step.
+      const approvedScenes = body.script
+        ? scriptToScenes(String(body.script).slice(0, 12000), body.scenes || [])
+        : Array.isArray(body.scenes) && body.scenes.length
+          ? body.scenes.slice(0, 8)
+          : null;
+      if (body.script && (!approvedScenes || !approvedScenes.length))
+        return bad(res, 400, "The edited script does not contain any usable scenes.");
+
       const job = createJob(
         {
           websiteUrl,
           changes,
           language,
           tone,
-          voiceId,
           device,
+          emotionStyle,
+          scenes: approvedScenes,
           subtitles: Boolean(body.subtitles),
           format: "mp4",
         },

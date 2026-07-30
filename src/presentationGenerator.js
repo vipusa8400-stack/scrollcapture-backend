@@ -4,25 +4,32 @@ const path = require("path");
 const { spawn } = require("child_process");
 const { chromium, devices } = require("playwright");
 const { updateJob } = require("./jobs");
-const { generateScenePlan } = require("./aiScript");
+const { generateScenePlan, CLICK_ACTIONS } = require("./aiScript");
 const { synthesizeSpeech } = require("./fishAudio");
+const { applyEmotionDirection, stripEmotionTags } = require("./emotionDirector");
+const { PAGE_RUNTIME } = require("./pageRuntime");
+const { resolveTarget, remeasure, sectionFallback } = require("./sceneTargeting");
+const {
+  FPS,
+  zoomScaleFor,
+  scrollTargetFor,
+  scrollTo,
+  moveCursor,
+  clickRipple,
+  animateZoom,
+  hold,
+} = require("./cinematics");
 
 const MIN_OUTPUT_BYTES = 10 * 1024;
-const FPS = 24;
 const SCROLL_SECONDS = 1.0;
 const ZOOM_IN_SECONDS = 0.9;
 const ZOOM_OUT_SECONDS = 0.5;
 const TAIL_SECONDS = 0.35;
-const ZOOM_SCALE = 1.35;
 
 const VIEWPORTS = {
   desktop: { width: 1280, height: 720 },
   mobile: { width: 390, height: 844 },
 };
-
-function easeInOut(t) {
-  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-}
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -60,94 +67,35 @@ function srtTime(seconds) {
   return `${h}:${m}:${s},${f}`;
 }
 
-const OVERLAY_SCRIPT = `
-window.__scWalkthrough = {
-  ensureOverlay() {
-    if (document.getElementById('__sc_overlay')) return;
-    const style = document.createElement('style');
-    style.id = '__sc_overlay_style';
-    style.textContent = \`
-      #__sc_overlay{position:absolute;pointer-events:none;z-index:2147483646;border-radius:14px;
-        border:3px solid rgba(59,130,246,.95);
-        box-shadow:0 0 0 6px rgba(59,130,246,.18),0 0 34px 8px rgba(59,130,246,.45);
-        transition:opacity .25s ease;opacity:0;}
-      html{scroll-behavior:auto !important;}
-    \`;
-    document.head.appendChild(style);
-    const el = document.createElement('div');
-    el.id = '__sc_overlay';
-    document.body.appendChild(el);
-  },
-  findTarget(query) {
-    const q = String(query || '').toLowerCase().trim();
-    if (!q) return null;
-    const words = q.split(/\\s+/).filter((w) => w.length > 2);
-    const candidates = Array.from(document.querySelectorAll(
-      'section,header,footer,nav,main,article,aside,div,a,button,form,img,h1,h2,h3,[role],[aria-label]'
-    ));
-    let best = null;
-    let bestScore = 0;
-    for (const el of candidates) {
-      const r = el.getBoundingClientRect();
-      if (r.width < 24 || r.height < 18) continue;
-      const cs = getComputedStyle(el);
-      if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) < 0.1) continue;
-      const hay = [
-        el.getAttribute('aria-label') || '',
-        el.getAttribute('id') || '',
-        el.className && typeof el.className === 'string' ? el.className : '',
-        el.getAttribute('href') || '',
-        el.getAttribute('alt') || '',
-        (el.textContent || '').slice(0, 240),
-        el.tagName,
-      ].join(' ').toLowerCase();
-      let score = 0;
-      if (hay.includes(q)) score += 6;
-      for (const w of words) if (hay.includes(w)) score += 2;
-      if (score === 0) continue;
-      const area = r.width * r.height;
-      if (area > window.innerWidth * window.innerHeight * 3) score -= 3;
-      if (el.children.length === 0) score += 1;
-      if (score > bestScore) { bestScore = score; best = el; }
+async function ensureRuntime(page) {
+  await page.evaluate(PAGE_RUNTIME).catch(() => {});
+  await page.evaluate(() => window.__scWalkthrough.ensureOverlay()).catch(() => {});
+}
+
+async function readMetrics(page) {
+  return (
+    (await page.evaluate(() => window.__scWalkthrough.metrics()).catch(() => null)) || {
+      scrollY: 0,
+      viewportWidth: 0,
+      viewportHeight: 0,
+      pageHeight: 0,
+      stickyHeaderHeight: 0,
     }
-    if (!best) return null;
-    const r = best.getBoundingClientRect();
-    return {
-      x: r.left + window.scrollX,
-      y: r.top + window.scrollY,
-      width: r.width,
-      height: r.height,
-    };
-  },
-  showHighlight(rect, pad) {
-    this.ensureOverlay();
-    const el = document.getElementById('__sc_overlay');
-    el.style.left = (rect.x - pad) + 'px';
-    el.style.top = (rect.y - pad) + 'px';
-    el.style.width = (rect.width + pad * 2) + 'px';
-    el.style.height = (rect.height + pad * 2) + 'px';
-    el.style.opacity = '1';
-  },
-  hideHighlight() {
-    const el = document.getElementById('__sc_overlay');
-    if (el) el.style.opacity = '0';
-  },
-  setZoom(scale, originX, originY) {
-    const root = document.documentElement;
-    if (scale === 1) {
-      root.style.transform = '';
-      root.style.transformOrigin = '';
-      return;
-    }
-    root.style.transformOrigin = originX + 'px ' + originY + 'px';
-    root.style.transform = 'scale(' + scale + ')';
-  },
-};
-`;
+  );
+}
 
 async function generatePresentation(job) {
   const { params } = job;
-  const { websiteUrl, changes, language, voiceId, tone, device, subtitles } = params;
+  const {
+    websiteUrl,
+    changes,
+    language,
+    tone,
+    device,
+    subtitles,
+    emotionStyle,
+    scenes: approvedScenes,
+  } = params;
 
   const viewport = VIEWPORTS[device] || VIEWPORTS.desktop;
   const jobRoot = path.join(os.tmpdir(), "scrollcapture-presentation", job.id);
@@ -172,35 +120,51 @@ async function generatePresentation(job) {
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
 
+    // Inject before navigation so the runtime survives route changes too.
+    await context.addInitScript(PAGE_RUNTIME).catch(() => {});
+
     await page.goto(websiteUrl, { waitUntil: "networkidle", timeout: 45000 }).catch(async () => {
       await page.goto(websiteUrl, { waitUntil: "load", timeout: 45000 });
     });
     await page.waitForTimeout(1500);
-    await page.addInitScript(OVERLAY_SCRIPT).catch(() => {});
-    await page.evaluate(OVERLAY_SCRIPT);
+    await ensureRuntime(page);
 
     const pageOutline = await page.evaluate(() => {
       const out = [];
       const nodes = document.querySelectorAll(
         "h1,h2,h3,a,button,section[id],nav,header,footer,[aria-label]",
       );
-      for (const el of Array.from(nodes).slice(0, 120)) {
+      for (const el of Array.from(nodes).slice(0, 140)) {
         const text = (el.getAttribute("aria-label") || el.textContent || "").trim().slice(0, 70);
         if (!text) continue;
-        const sel = el.id ? `#${el.id}` : el.tagName.toLowerCase();
+        const sel = el.id
+          ? `#${el.id}`
+          : el.getAttribute("href")
+            ? `${el.tagName.toLowerCase()}[href="${el.getAttribute("href")}"]`
+            : el.tagName.toLowerCase();
         out.push(`${text} | ${el.tagName.toLowerCase()} | ${sel}`);
       }
       return out;
     });
 
-    updateJob(job.id, { status: "scripting", step: "Creating AI script", progress: 14 });
-    const plan = await generateScenePlan({
-      websiteUrl,
-      changes,
-      language,
-      tone,
-      pageOutline,
-    });
+    let plan;
+    if (Array.isArray(approvedScenes) && approvedScenes.length) {
+      plan = {
+        script: approvedScenes.map((s) => s.speech).join("\n\n"),
+        scenes: approvedScenes,
+      };
+    } else {
+      updateJob(job.id, { status: "scripting", step: "Creating AI script", progress: 14 });
+      plan = await generateScenePlan({ websiteUrl, changes, language, tone, pageOutline });
+      updateJob(job.id, { step: "Directing voice emotions", progress: 20 });
+      plan.scenes = await applyEmotionDirection({
+        scenes: plan.scenes,
+        emotionStyle: emotionStyle || "auto",
+        language,
+        changes,
+      });
+      plan.script = plan.scenes.map((s) => s.speech).join("\n\n");
+    }
 
     updateJob(job.id, {
       status: "voicing",
@@ -212,42 +176,19 @@ async function generatePresentation(job) {
     const audioClips = [];
     for (let i = 0; i < plan.scenes.length; i++) {
       const clipPath = path.join(audioDir, `scene-${i}.mp3`);
-      await synthesizeSpeech({ text: plan.scenes[i].speech, voiceId, outputPath: clipPath });
+      await synthesizeSpeech({ text: plan.scenes[i].speech, outputPath: clipPath });
       audioClips.push({ path: clipPath, duration: await audioDuration(clipPath) });
-      updateJob(job.id, {
-        progress: 26 + Math.round(((i + 1) / plan.scenes.length) * 12),
-      });
+      updateJob(job.id, { progress: 26 + Math.round(((i + 1) / plan.scenes.length) * 12) });
     }
 
     updateJob(job.id, { status: "locating", step: "Finding elements", progress: 40 });
-
-    const pageHeight = await page.evaluate(() =>
-      Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
-    );
-    const maxScroll = Math.max(0, pageHeight - viewport.height);
-
-    const targets = [];
-    for (let i = 0; i < plan.scenes.length; i++) {
-      const rect = await page.evaluate(
-        (q) => window.__scWalkthrough.findTarget(q),
-        plan.scenes[i].target || plan.scenes[i].title,
-      );
-      targets.push(
-        rect || {
-          x: 0,
-          y: Math.min(maxScroll, Math.round((i / Math.max(1, plan.scenes.length)) * maxScroll)),
-          width: viewport.width,
-          height: viewport.height * 0.6,
-        },
-      );
-    }
-
     updateJob(job.id, { status: "recording", step: "Recording scenes", progress: 46 });
 
     let frameIndex = 0;
-    let currentScroll = 0;
     let timeline = 0;
     const srtParts = [];
+    const sceneTimings = [];
+    const state = { cursor: null };
 
     const shoot = async () => {
       frameIndex += 1;
@@ -259,80 +200,134 @@ async function generatePresentation(job) {
 
     for (let i = 0; i < plan.scenes.length; i++) {
       const scene = plan.scenes[i];
-      const rect = targets[i];
       const clip = audioClips[i];
-      const wantsZoom = scene.action !== "highlight";
-      const wantsHighlight = scene.action !== "zoom";
+      let lead = 0;
+      let trail = 0;
 
-      const targetCenterY = rect.y + rect.height / 2;
-      const destScroll = Math.max(
-        0,
-        Math.min(maxScroll, Math.round(targetCenterY - viewport.height / 2)),
-      );
+      await ensureRuntime(page);
+      let metrics = await readMetrics(page);
 
-      // Cinematic scroll to the element.
-      const scrollFrames = Math.round(SCROLL_SECONDS * FPS);
-      const from = currentScroll;
-      for (let f = 0; f < scrollFrames; f++) {
-        const y = Math.round(from + (destScroll - from) * easeInOut(f / (scrollFrames - 1 || 1)));
-        await page.evaluate((sy) => window.scrollTo(0, sy), y);
-        await shoot();
+      // --- 1. Locate the exact element for THIS scene (never a fixed position).
+      let found = await resolveTarget(page, scene);
+      let usedFallback = false;
+      if (!found) {
+        found = sectionFallback({
+          index: i,
+          total: plan.scenes.length,
+          maxScroll: Math.max(0, metrics.pageHeight - viewport.height),
+          viewport,
+        });
+        usedFallback = true;
       }
-      currentScroll = destScroll;
-      timeline += SCROLL_SECONDS;
 
+      // --- 2. Scroll so the element sits in the centre (below sticky headers).
+      let dest = scrollTargetFor(found.rect, viewport, metrics);
+      lead += await scrollTo(page, shoot, metrics.scrollY, dest, SCROLL_SECONDS);
+      metrics = await readMetrics(page);
+      found = usedFallback ? found : await remeasure(page, found, scene);
+
+      // --- 3. Optional interaction: cursor -> hover -> click -> wait -> recalc.
+      if (CLICK_ACTIONS.has(scene.action) && found.selector) {
+        const cx = Math.round(found.rect.x + found.rect.width / 2);
+        const cy = Math.round(found.rect.y + found.rect.height / 2);
+        lead += await moveCursor(page, shoot, state, cx, cy, { seconds: 0.9, hover: 0.3 });
+        lead += await clickRipple(page, shoot, state, 0.4);
+
+        const before = page.url();
+        await page
+          .locator(found.selector)
+          .first()
+          .click({ timeout: 4000, noWaitAfter: true })
+          .catch(() => {});
+        await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(900); // animations / menu open / content load
+        lead += await hold(shoot, 0.9);
+
+        await ensureRuntime(page);
+        metrics = await readMetrics(page);
+
+        // Recalculate everything after the layout / route change.
+        const navigated = page.url() !== before;
+        const followUp = {
+          ...scene,
+          selector: null,
+          selectors: [],
+          target: scene.expectedDestination
+            ? String(scene.expectedDestination).replace(/^[#/]/, "").replace(/[-_]/g, " ")
+            : scene.target,
+        };
+        const next =
+          (scene.expectedDestination ? await resolveTarget(page, followUp) : null) ||
+          (navigated ? null : await remeasure(page, found, scene));
+        if (next) {
+          found = next;
+          usedFallback = false;
+          dest = scrollTargetFor(found.rect, viewport, metrics);
+          lead += await scrollTo(page, shoot, metrics.scrollY, dest, 0.8);
+          metrics = await readMetrics(page);
+          found = await remeasure(page, found, scene);
+        } else {
+          // Landed on a new page: present the top section instead of a random zoom.
+          found = {
+            rect: { x: 0, y: metrics.scrollY, width: viewport.width, height: viewport.height },
+            selector: null,
+            source: "section",
+          };
+          usedFallback = true;
+        }
+      }
+
+      // --- 4. Highlight the exact element and zoom around it.
+      const wantsHighlight = !usedFallback && scene.action !== "zoom" && scene.action !== "scroll_to";
+      const wantsZoom = scene.action !== "highlight" && scene.action !== "scroll_to";
       if (wantsHighlight) {
-        await page.evaluate(
-          (r) => window.__scWalkthrough.showHighlight(r, 8),
-          rect,
-        );
+        await page.evaluate((r) => window.__scWalkthrough.showHighlight(r, 8), found.rect);
       }
 
-      const originX = rect.x + rect.width / 2;
-      const originY = rect.y + rect.height / 2;
+      const targetScale = wantsZoom
+        ? usedFallback
+          ? Math.min(1.15, zoomScaleFor(found.rect, viewport))
+          : zoomScaleFor(found.rect, viewport)
+        : 1;
+      const originX = Math.round(found.rect.x + found.rect.width / 2);
+      const originY = Math.round(found.rect.y + found.rect.height / 2);
 
-      // Zoom in.
-      const zoomInFrames = Math.round(ZOOM_IN_SECONDS * FPS);
-      for (let f = 0; f < zoomInFrames; f++) {
-        const p = easeInOut(f / (zoomInFrames - 1 || 1));
-        const scale = wantsZoom ? 1 + (ZOOM_SCALE - 1) * p : 1;
-        await page.evaluate(
-          ([s, ox, oy]) => window.__scWalkthrough.setZoom(s, ox, oy),
-          [scale, originX, originY],
-        );
-        await shoot();
+      lead += await animateZoom(page, shoot, 1, targetScale, originX, originY, ZOOM_IN_SECONDS);
+
+      // Keep the cursor near — but not on top of — the text while speaking.
+      if (state.cursor && !usedFallback) {
+        const parkX = Math.round(found.rect.x + found.rect.width + 26);
+        const parkY = Math.round(found.rect.y + found.rect.height + 22);
+        lead += await moveCursor(page, shoot, state, parkX, parkY, { seconds: 0.4, hover: 0 });
       }
-      timeline += ZOOM_IN_SECONDS;
 
-      // Hold while the narration plays.
-      const holdStart = timeline;
-      const holdFrames = Math.max(1, Math.round(clip.duration * FPS));
-      for (let f = 0; f < holdFrames; f++) await shoot();
-      timeline += clip.duration;
+      // --- 5. Hold while the narration plays.
+      const holdStart = timeline + lead;
+      const held = await hold(shoot, clip.duration);
+      srtParts.push({
+        start: holdStart,
+        end: holdStart + held,
+        text: stripEmotionTags(scene.speech),
+      });
 
-      srtParts.push({ start: holdStart, end: timeline, text: scene.speech });
-
-      // Zoom back out.
-      const zoomOutFrames = Math.round(ZOOM_OUT_SECONDS * FPS);
-      for (let f = 0; f < zoomOutFrames; f++) {
-        const p = easeInOut(f / (zoomOutFrames - 1 || 1));
-        const scale = wantsZoom ? ZOOM_SCALE + (1 - ZOOM_SCALE) * p : 1;
-        await page.evaluate(
-          ([s, ox, oy]) => window.__scWalkthrough.setZoom(s, ox, oy),
-          [scale, originX, originY],
-        );
-        await shoot();
-      }
+      // --- 6. Zoom back out and reset the camera before the next element.
+      trail += await animateZoom(
+        page,
+        shoot,
+        targetScale,
+        1,
+        originX,
+        originY,
+        ZOOM_OUT_SECONDS,
+      );
       await page.evaluate(() => {
         window.__scWalkthrough.setZoom(1, 0, 0);
         window.__scWalkthrough.hideHighlight();
       });
-      timeline += ZOOM_OUT_SECONDS;
+      trail += await hold(shoot, TAIL_SECONDS);
 
-      // Small breath between scenes.
-      const tailFrames = Math.round(TAIL_SECONDS * FPS);
-      for (let f = 0; f < tailFrames; f++) await shoot();
-      timeline += TAIL_SECONDS;
+      timeline += lead + held + trail;
+      sceneTimings.push({ lead, hold: held, trail });
 
       updateJob(job.id, {
         progress: 46 + Math.round(((i + 1) / plan.scenes.length) * 34),
@@ -344,23 +339,23 @@ async function generatePresentation(job) {
 
     updateJob(job.id, { status: "rendering", step: "Rendering video", progress: 84 });
 
-    // Build the narration track: silence padding + speech, per scene.
+    // Narration track: per-scene silence lead + speech + trail, matching the video.
     const trackPath = path.join(audioDir, "narration.m4a");
     const inputs = [];
     const filters = [];
-    let idx = 0;
     for (let i = 0; i < audioClips.length; i++) {
-      const lead = SCROLL_SECONDS + ZOOM_IN_SECONDS;
-      const trail = ZOOM_OUT_SECONDS + TAIL_SECONDS;
+      const { lead, trail } = sceneTimings[i];
+      const leadMs = Math.max(0, Math.round(lead * 1000));
       inputs.push("-i", audioClips[i].path);
       filters.push(
-        `[${idx}:a]aresample=44100,adelay=${Math.round(lead * 1000)}|${Math.round(
-          lead * 1000,
-        )},apad=pad_dur=${trail.toFixed(2)}[a${idx}]`,
+        `[${i}:a]aresample=44100,adelay=${leadMs}|${leadMs},apad=pad_dur=${Math.max(
+          0.05,
+          trail,
+        ).toFixed(2)}[a${i}]`,
       );
-      idx += 1;
     }
-    const concat = `${filters.map((_, i) => `[a${i}]`).join("")}concat=n=${idx}:v=0:a=1[out]`;
+    const n = audioClips.length;
+    const concat = `${filters.map((_, i) => `[a${i}]`).join("")}concat=n=${n}:v=0:a=1[out]`;
     await run("ffmpeg", [
       "-y",
       ...inputs,
@@ -375,10 +370,7 @@ async function generatePresentation(job) {
     if (subtitles) {
       const srtPath = path.join(jobRoot, "subs.srt");
       const srt = srtParts
-        .map(
-          (p, i) =>
-            `${i + 1}\n${srtTime(p.start)} --> ${srtTime(p.end)}\n${p.text}\n`,
-        )
+        .map((p, i) => `${i + 1}\n${srtTime(p.start)} --> ${srtTime(p.end)}\n${p.text}\n`)
         .join("\n");
       await fs.promises.writeFile(srtPath, srt, "utf8");
       videoFilters.push(

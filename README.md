@@ -83,6 +83,12 @@ Required Railway environment variables:
 - `OPENAI_API_KEY` — used to generate the narration script and scene plan (JSON)
 - `OPENAI_MODEL` — optional, defaults to `gpt-4o-mini`
 - `FISH_AUDIO_API_KEY` — used for text-to-speech
+- `DEFAULT_FISH_MODEL` — fixed TTS model, defaults to `S2.1_PRO`
+- `DEFAULT_FISH_VOICE` — fixed reference voice, defaults to `Sarah`
+- `DEFAULT_FISH_VOICE_ID` — optional: exact Fish Audio `reference_id` for the voice above (skips the name lookup)
+
+The voice is never chosen by the frontend: every TTS request uses the model/voice above,
+and failed calls are retried automatically (429 / 5xx, 4 attempts with backoff).
 - `FISH_AUDIO_MODEL` — optional, defaults to `speech-1.6`
 
 Both keys are only ever read on the backend; the frontend never sees them.
