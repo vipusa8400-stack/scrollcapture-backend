@@ -68,3 +68,21 @@ system setup is needed on Railway.
   for MVP; swap in Redis/Postgres later if you need durability.
 - Concurrency is intentionally 1. Increase carefully: Chromium + FFmpeg are
   memory-hungry.
+## AI Website Presentation
+
+Endpoints:
+
+- `POST /api/presentations` — body: `websiteUrl`, `changes`, `language` (`en` | `ms`),
+  `voiceId` (Fish Audio reference id, optional), `tone` (`professional` | `friendly` | `premium`),
+  `device` (`desktop` | `mobile`), `subtitles` (boolean)
+- `GET /api/presentations/:jobId`
+- `GET /api/presentations/:jobId/download`
+
+Required Railway environment variables:
+
+- `OPENAI_API_KEY` — used to generate the narration script and scene plan (JSON)
+- `OPENAI_MODEL` — optional, defaults to `gpt-4o-mini`
+- `FISH_AUDIO_API_KEY` — used for text-to-speech
+- `FISH_AUDIO_MODEL` — optional, defaults to `speech-1.6`
+
+Both keys are only ever read on the backend; the frontend never sees them.

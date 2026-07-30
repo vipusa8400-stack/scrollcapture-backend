@@ -7,6 +7,7 @@ const { createJob, getJob, publicJob, setWorker } = require("./jobs");
 const { generateVideo } = require("./videoGenerator");
 const { generateScreenshot } = require("./screenshotGenerator");
 const { generatePdf } = require("./pdfGenerator");
+const { generatePresentation } = require("./presentationGenerator");
 
 const ALLOWED_DEVICES = new Set(["desktop", "mobile"]);
 const ALLOWED_RATIOS = new Set(["vertical", "square", "horizontal"]);
@@ -38,6 +39,8 @@ const ALLOWED_DELAYS = new Set([1000, 3000, 5000]);
 const ALLOWED_PAPER_SIZES = new Set(["a4", "letter", "legal"]);
 const ALLOWED_ORIENTATIONS = new Set(["portrait", "landscape"]);
 const ALLOWED_MARGINS = new Set(["none", "small", "normal", "large"]);
+const ALLOWED_LANGUAGES = new Set(["en", "ms"]);
+const ALLOWED_TONES = new Set(["professional", "friendly", "premium"]);
 
 function bad(res, code, message) {
   return res.status(code).json({ error: "invalid_request", message });
@@ -56,6 +59,7 @@ async function main() {
   setWorker((job) => {
     if (job.kind === "screenshot") return generateScreenshot(job);
     if (job.kind === "pdf") return generatePdf(job);
+    if (job.kind === "presentation") return generatePresentation(job);
     return generateVideo(job);
   });
 
@@ -198,6 +202,72 @@ async function main() {
     const job = getJob(req.params.jobId);
     if (!job || job.kind !== "pdf") return res.status(404).json({ error: "not_found" });
     res.json(publicJob(job));
+  });
+
+  app.post("/api/presentations", async (req, res) => {
+    try {
+      const body = req.body || {};
+      const device = String(body.device || "desktop");
+      const language = String(body.language || "en");
+      const tone = String(body.tone || "professional");
+      const voiceId = body.voiceId ? String(body.voiceId).slice(0, 120) : "";
+      const changes = String(body.changes || "").trim();
+
+      if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
+      if (!ALLOWED_LANGUAGES.has(language)) return bad(res, 400, "Invalid language.");
+      if (!ALLOWED_TONES.has(tone)) return bad(res, 400, "Invalid tone.");
+      if (changes.length < 10 || changes.length > 4000)
+        return bad(res, 400, "Please describe the website changes (10-4000 characters).");
+
+      let websiteUrl;
+      try {
+        websiteUrl = await validateAndNormalizeUrl(body.websiteUrl);
+      } catch (err) {
+        return bad(res, 400, err.message);
+      }
+
+      const job = createJob(
+        {
+          websiteUrl,
+          changes,
+          language,
+          tone,
+          voiceId,
+          device,
+          subtitles: Boolean(body.subtitles),
+          format: "mp4",
+        },
+        "presentation",
+      );
+      res.status(202).json(publicJob(job));
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "server_error", message: err.message });
+    }
+  });
+
+  app.get("/api/presentations/:jobId", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "presentation") return res.status(404).json({ error: "not_found" });
+    res.json(publicJob(job));
+  });
+
+  app.get("/api/presentations/:jobId/download", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "presentation") return res.status(404).send("Not found");
+    if (job.status !== "completed" || !job.filePath) {
+      return res.status(409).send("Job not completed");
+    }
+    if (!fs.existsSync(job.filePath)) {
+      return res.status(410).send("File expired");
+    }
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="presentation-${job.id}.mp4"`,
+    );
+    res.setHeader("Content-Length", String(job.fileSize));
+    fs.createReadStream(job.filePath).pipe(res);
   });
 
   app.get("/api/pdf/:jobId/download", (req, res) => {

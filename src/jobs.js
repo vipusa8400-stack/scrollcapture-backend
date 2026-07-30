@@ -17,6 +17,11 @@ const VALID_STATUSES = new Set([
   "generating_pdf",
   "finalizing",
   "rendering",
+  "analyzing",
+  "scripting",
+  "voicing",
+  "locating",
+  "recording",
   "completed",
   "failed",
 ]);
@@ -42,6 +47,10 @@ function createJob(params, kind = "video") {
     pageCount: null,
     width: null,
     height: null,
+    durationSeconds: null,
+    sceneCount: null,
+    script: null,
+    scenes: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     startedAt: null,
@@ -67,7 +76,13 @@ function publicJob(job) {
     estimatedSecondsRemaining = Math.max(1, Math.round(total - elapsed));
   }
   const base =
-    job.kind === "screenshot" ? "screenshots" : job.kind === "pdf" ? "pdf" : "jobs";
+    job.kind === "screenshot"
+      ? "screenshots"
+      : job.kind === "pdf"
+        ? "pdf"
+        : job.kind === "presentation"
+          ? "presentations"
+          : "jobs";
   return {
     id: job.id,
     kind: job.kind,
@@ -80,6 +95,10 @@ function publicJob(job) {
     pageCount: job.pageCount,
     width: job.width,
     height: job.height,
+    durationSeconds: job.durationSeconds,
+    sceneCount: job.sceneCount,
+    script: job.script,
+    scenes: job.scenes,
     estimatedSecondsRemaining,
     downloadUrl: job.status === "completed" ? `/api/${base}/${job.id}/download` : null,
     createdAt: job.createdAt,
