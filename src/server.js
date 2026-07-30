@@ -6,6 +6,7 @@ const { validateAndNormalizeUrl } = require("./urlSecurity");
 const { createJob, getJob, publicJob, setWorker } = require("./jobs");
 const { generateVideo } = require("./videoGenerator");
 const { generateScreenshot } = require("./screenshotGenerator");
+const { generatePdf } = require("./pdfGenerator");
 
 const ALLOWED_DEVICES = new Set(["desktop", "mobile"]);
 const ALLOWED_RATIOS = new Set(["vertical", "square", "horizontal"]);
@@ -19,6 +20,7 @@ const MIME = {
   gif: "image/gif",
   png: "image/png",
   jpg: "image/jpeg",
+  pdf: "application/pdf",
 };
 
 const RATIO_ALIASES = {
@@ -33,6 +35,9 @@ const RATIO_ALIASES = {
 const ALLOWED_IMAGE_FORMATS = new Set(["png", "jpg"]);
 const ALLOWED_QUALITIES = new Set([70, 85, 95]);
 const ALLOWED_DELAYS = new Set([1000, 3000, 5000]);
+const ALLOWED_PAPER_SIZES = new Set(["a4", "letter", "legal"]);
+const ALLOWED_ORIENTATIONS = new Set(["portrait", "landscape"]);
+const ALLOWED_MARGINS = new Set(["none", "small", "normal", "large"]);
 
 function bad(res, code, message) {
   return res.status(code).json({ error: "invalid_request", message });
@@ -48,7 +53,11 @@ async function main() {
   );
   app.use(express.json({ limit: "64kb" }));
 
-  setWorker((job) => (job.kind === "screenshot" ? generateScreenshot(job) : generateVideo(job)));
+  setWorker((job) => {
+    if (job.kind === "screenshot") return generateScreenshot(job);
+    if (job.kind === "pdf") return generatePdf(job);
+    return generateVideo(job);
+  });
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true, uptime: process.uptime() });
@@ -144,6 +153,69 @@ async function main() {
     const job = getJob(req.params.jobId);
     if (!job || job.kind !== "screenshot") return res.status(404).json({ error: "not_found" });
     res.json(publicJob(job));
+  });
+
+  app.post("/api/pdf", async (req, res) => {
+    try {
+      const body = req.body || {};
+      const device = String(body.device || "");
+      const paperSize = String(body.paperSize || "a4").toLowerCase();
+      const orientation = String(body.orientation || "portrait").toLowerCase();
+      const margin = String(body.margin || "normal").toLowerCase();
+
+      if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
+      if (!ALLOWED_PAPER_SIZES.has(paperSize)) return bad(res, 400, "Invalid paperSize.");
+      if (!ALLOWED_ORIENTATIONS.has(orientation)) return bad(res, 400, "Invalid orientation.");
+      if (!ALLOWED_MARGINS.has(margin)) return bad(res, 400, "Invalid margin.");
+
+      let websiteUrl;
+      try {
+        websiteUrl = await validateAndNormalizeUrl(body.websiteUrl);
+      } catch (err) {
+        return bad(res, 400, err.message);
+      }
+
+      const job = createJob(
+        {
+          websiteUrl,
+          device,
+          paperSize,
+          orientation,
+          margin,
+          printBackground: body.printBackground !== false,
+          format: "pdf",
+        },
+        "pdf",
+      );
+      res.status(202).json(publicJob(job));
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "server_error", message: err.message });
+    }
+  });
+
+  app.get("/api/pdf/:jobId", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "pdf") return res.status(404).json({ error: "not_found" });
+    res.json(publicJob(job));
+  });
+
+  app.get("/api/pdf/:jobId/download", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "pdf") return res.status(404).send("Not found");
+    if (job.status !== "completed" || !job.filePath) {
+      return res.status(409).send("Job not completed");
+    }
+    if (!fs.existsSync(job.filePath)) {
+      return res.status(410).send("File expired");
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="scrollcapture-${job.id}.pdf"`,
+    );
+    res.setHeader("Content-Length", String(job.fileSize));
+    fs.createReadStream(job.filePath).pipe(res);
   });
 
   app.get("/api/screenshots/:jobId/download", (req, res) => {

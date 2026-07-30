@@ -13,6 +13,8 @@ const VALID_STATUSES = new Set([
   "scrolling",
   "preparing_capture",
   "capturing",
+  "preparing_print",
+  "generating_pdf",
   "finalizing",
   "rendering",
   "completed",
@@ -37,6 +39,7 @@ function createJob(params, kind = "video") {
     filePath: null,
     fileSize: 0,
     format: params.format,
+    pageCount: null,
     width: null,
     height: null,
     createdAt: Date.now(),
@@ -63,7 +66,8 @@ function publicJob(job) {
     const total = elapsed / (job.progress / 100);
     estimatedSecondsRemaining = Math.max(1, Math.round(total - elapsed));
   }
-  const base = job.kind === "screenshot" ? "screenshots" : "jobs";
+  const base =
+    job.kind === "screenshot" ? "screenshots" : job.kind === "pdf" ? "pdf" : "jobs";
   return {
     id: job.id,
     kind: job.kind,
@@ -73,6 +77,7 @@ function publicJob(job) {
     error: job.error,
     format: job.format,
     fileSize: job.fileSize,
+    pageCount: job.pageCount,
     width: job.width,
     height: job.height,
     estimatedSecondsRemaining,
