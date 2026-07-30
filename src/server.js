@@ -5,6 +5,7 @@ const fs = require("fs");
 const { validateAndNormalizeUrl } = require("./urlSecurity");
 const { createJob, getJob, publicJob, setWorker } = require("./jobs");
 const { generateVideo } = require("./videoGenerator");
+const { generateScreenshot } = require("./screenshotGenerator");
 
 const ALLOWED_DEVICES = new Set(["desktop", "mobile"]);
 const ALLOWED_RATIOS = new Set(["vertical", "square", "horizontal"]);
@@ -16,6 +17,8 @@ const MIME = {
   mp4: "video/mp4",
   webm: "video/webm",
   gif: "image/gif",
+  png: "image/png",
+  jpg: "image/jpeg",
 };
 
 const RATIO_ALIASES = {
@@ -26,6 +29,10 @@ const RATIO_ALIASES = {
   square: "square",
   horizontal: "horizontal",
 };
+
+const ALLOWED_IMAGE_FORMATS = new Set(["png", "jpg"]);
+const ALLOWED_QUALITIES = new Set([70, 85, 95]);
+const ALLOWED_DELAYS = new Set([1000, 3000, 5000]);
 
 function bad(res, code, message) {
   return res.status(code).json({ error: "invalid_request", message });
@@ -41,7 +48,7 @@ async function main() {
   );
   app.use(express.json({ limit: "64kb" }));
 
-  setWorker(generateVideo);
+  setWorker((job) => (job.kind === "screenshot" ? generateScreenshot(job) : generateVideo(job)));
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true, uptime: process.uptime() });
@@ -90,6 +97,69 @@ async function main() {
     const job = getJob(req.params.jobId);
     if (!job) return res.status(404).json({ error: "not_found" });
     res.json(publicJob(job));
+  });
+
+  app.post("/api/screenshots", async (req, res) => {
+    try {
+      const body = req.body || {};
+      const device = String(body.device || "");
+      const format = String(body.format || "png").toLowerCase();
+      const quality = body.quality === undefined ? 85 : Number(body.quality);
+      const delay = body.delay === undefined ? 3000 : Number(body.delay);
+
+      if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
+      if (!ALLOWED_IMAGE_FORMATS.has(format)) return bad(res, 400, "Invalid format.");
+      if (format === "jpg" && !ALLOWED_QUALITIES.has(quality))
+        return bad(res, 400, "Invalid quality.");
+      if (!ALLOWED_DELAYS.has(delay)) return bad(res, 400, "Invalid delay.");
+
+      let websiteUrl;
+      try {
+        websiteUrl = await validateAndNormalizeUrl(body.websiteUrl);
+      } catch (err) {
+        return bad(res, 400, err.message);
+      }
+
+      const job = createJob(
+        {
+          websiteUrl,
+          device,
+          format,
+          quality,
+          delay,
+          hideCookiePopups: Boolean(body.hideCookiePopups),
+          hideFixedHeaders: Boolean(body.hideFixedHeaders),
+          transparentBackground: Boolean(body.transparentBackground),
+        },
+        "screenshot",
+      );
+      res.status(202).json(publicJob(job));
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "server_error", message: err.message });
+    }
+  });
+
+  app.get("/api/screenshots/:jobId", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "screenshot") return res.status(404).json({ error: "not_found" });
+    res.json(publicJob(job));
+  });
+
+  app.get("/api/screenshots/:jobId/download", (req, res) => {
+    const job = getJob(req.params.jobId);
+    if (!job || job.kind !== "screenshot") return res.status(404).send("Not found");
+    if (job.status !== "completed" || !job.filePath) {
+      return res.status(409).send("Job not completed");
+    }
+    if (!fs.existsSync(job.filePath)) {
+      return res.status(410).send("File expired");
+    }
+    const filename = `scrollcapture-${job.id}.${job.format}`;
+    res.setHeader("Content-Type", MIME[job.format] || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", String(job.fileSize));
+    fs.createReadStream(job.filePath).pipe(res);
   });
 
   app.get("/api/jobs/:jobId/download", (req, res) => {

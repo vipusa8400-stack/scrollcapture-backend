@@ -7,9 +7,13 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 
 const VALID_STATUSES = new Set([
   "queued",
+  "validating",
   "opening_page",
   "loading_content",
   "scrolling",
+  "preparing_capture",
+  "capturing",
+  "finalizing",
   "rendering",
   "completed",
   "failed",
@@ -20,10 +24,11 @@ const queue = [];
 let processing = false;
 let worker = null;
 
-function createJob(params) {
+function createJob(params, kind = "video") {
   const id = randomUUID();
   const job = {
     id,
+    kind,
     params,
     status: "queued",
     progress: 0,
@@ -32,6 +37,8 @@ function createJob(params) {
     filePath: null,
     fileSize: 0,
     format: params.format,
+    width: null,
+    height: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     startedAt: null,
@@ -56,16 +63,20 @@ function publicJob(job) {
     const total = elapsed / (job.progress / 100);
     estimatedSecondsRemaining = Math.max(1, Math.round(total - elapsed));
   }
+  const base = job.kind === "screenshot" ? "screenshots" : "jobs";
   return {
     id: job.id,
+    kind: job.kind,
     status: job.status,
     step: job.step,
     progress: job.progress,
     error: job.error,
     format: job.format,
     fileSize: job.fileSize,
+    width: job.width,
+    height: job.height,
     estimatedSecondsRemaining,
-    downloadUrl: job.status === "completed" ? `/api/jobs/${job.id}/download` : null,
+    downloadUrl: job.status === "completed" ? `/api/${base}/${job.id}/download` : null,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
   };
