@@ -22,6 +22,9 @@ window.__scWalkthrough = {
       #__sc_ripple{position:absolute;pointer-events:none;z-index:2147483645;width:14px;height:14px;
         margin-left:-7px;margin-top:-7px;border-radius:999px;opacity:0;
         background:rgba(59,130,246,.35);border:2px solid rgba(59,130,246,.8);}
+      .__sc_trail{position:absolute;pointer-events:none;z-index:2147483644;width:9px;height:9px;
+        margin-left:-4px;margin-top:-4px;border-radius:999px;opacity:0;
+        background:rgba(59,130,246,.28);}
       html{scroll-behavior:auto !important;}
     \`;
     document.head.appendChild(style);
@@ -56,6 +59,88 @@ window.__scWalkthrough = {
     };
   },
   findTarget(query) {
+    return this._findTarget(query);
+  },
+  chrome() {
+    let top = 0;
+    let bottom = 0;
+    const overlays = [];
+    for (const el of Array.from(document.querySelectorAll('body *'))) {
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
+      if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) < 0.1) continue;
+      if (el.id && el.id.indexOf('__sc_') === 0) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 40 || r.height < 8) continue;
+      if (r.top <= 6 && r.height < window.innerHeight * 0.4 && r.height > top) top = r.height;
+      else if (r.bottom >= window.innerHeight - 6 && r.height < window.innerHeight * 0.35 && r.height > bottom) bottom = r.height;
+      else if (r.height > window.innerHeight * 0.4 && r.width > window.innerWidth * 0.5) {
+        overlays.push({ x: r.left, y: r.top, width: r.width, height: r.height });
+      }
+    }
+    return {
+      stickyHeaderHeight: Math.round(top),
+      bottomBarHeight: Math.round(bottom),
+      blockingOverlays: overlays.length,
+      scrollY: window.scrollY,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      pageHeight: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+    };
+  },
+  assetsReady() {
+    const imgs = Array.from(document.images).filter((i) => {
+      const r = i.getBoundingClientRect();
+      return r.bottom > -200 && r.top < window.innerHeight + 200 && r.width > 8;
+    });
+    const loaded = imgs.filter((i) => i.complete && i.naturalWidth > 0).length;
+    const fonts = !document.fonts || document.fonts.status === 'loaded';
+    return { fonts: fonts, images: imgs.length ? loaded / imgs.length : 1 };
+  },
+  /** How much of the target is really visible and un-covered, 0..1 each. */
+  inspect(rect, safeTop, safeBottom) {
+    const top = safeTop || 0;
+    const bottom = safeBottom || 0;
+    const vt = window.scrollY + top;
+    const vb = window.scrollY + window.innerHeight - bottom;
+    const iy = Math.max(0, Math.min(rect.y + rect.height, vb) - Math.max(rect.y, vt));
+    const vl = window.scrollX;
+    const vr = window.scrollX + window.innerWidth;
+    const ix = Math.max(0, Math.min(rect.x + rect.width, vr) - Math.max(rect.x, vl));
+    const visibleRatio = (ix * iy) / Math.max(1, rect.width * rect.height);
+
+    let sampled = 0;
+    let covered = 0;
+    let behindHeader = 0;
+    for (let gx = 1; gx <= 3; gx++) {
+      for (let gy = 1; gy <= 3; gy++) {
+        const px = rect.x + (rect.width * gx) / 4 - window.scrollX;
+        const py = rect.y + (rect.height * gy) / 4 - window.scrollY;
+        if (px < 0 || py < 0 || px > window.innerWidth || py > window.innerHeight) continue;
+        sampled++;
+        if (py < top || py > window.innerHeight - bottom) { behindHeader++; continue; }
+        const el = document.elementFromPoint(px, py);
+        if (!el) { covered++; continue; }
+        const cs = getComputedStyle(el);
+        let node = el;
+        let fixed = false;
+        while (node && node !== document.body) {
+          const s = getComputedStyle(node);
+          if (s.position === 'fixed' || Number(s.zIndex) > 9000) { fixed = true; break; }
+          node = node.parentElement;
+        }
+        if (fixed && (el.id || '').indexOf('__sc_') !== 0) covered++;
+        else if (cs.visibility === 'hidden') covered++;
+      }
+    }
+    return {
+      visibleRatio: Math.max(0, Math.min(1, visibleRatio)),
+      coveredRatio: sampled ? covered / sampled : 1,
+      behindChromeRatio: sampled ? behindHeader / sampled : 1,
+      sampled: sampled,
+    };
+  },
+  _findTarget(query) {
     const q = String(query || '').toLowerCase().trim();
     if (!q) return null;
     const words = q.split(/\\s+/).filter((w) => w.length > 2);
@@ -117,8 +202,44 @@ window.__scWalkthrough = {
     c.style.top = y + 'px';
     c.style.opacity = '1';
     const inv = 1 / (this._scale || 1);
-    c.style.transform = 'scale(' + inv + ')';
+    c.style.transform = 'scale(' + (inv * (this._press || 1)) + ')';
     c.style.transformOrigin = 'top left';
+    if (this._trail) this.pushTrail(x, y, inv);
+  },
+  setPress(amount) {
+    this._press = 1 - Math.max(0, Math.min(0.25, amount || 0));
+    const c = document.getElementById('__sc_cursor');
+    if (!c) return;
+    const inv = 1 / (this._scale || 1);
+    c.style.transform = 'scale(' + (inv * this._press) + ')';
+    c.style.transformOrigin = 'top left';
+  },
+  enableTrail(on) {
+    this._trail = Boolean(on);
+    if (!on) this.clearTrail();
+  },
+  pushTrail(x, y, inv) {
+    this.ensureOverlay();
+    this._trailNodes = this._trailNodes || [];
+    const dot = document.createElement('div');
+    dot.className = '__sc_trail';
+    dot.style.left = x + 'px';
+    dot.style.top = y + 'px';
+    dot.style.opacity = '0.55';
+    dot.style.transform = 'scale(' + inv + ')';
+    document.body.appendChild(dot);
+    this._trailNodes.push(dot);
+    if (this._trailNodes.length > 10) {
+      const old = this._trailNodes.shift();
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+    }
+    this._trailNodes.forEach((n, i) => {
+      n.style.opacity = String(0.06 + (i / this._trailNodes.length) * 0.4);
+    });
+  },
+  clearTrail() {
+    (this._trailNodes || []).forEach((n) => n.parentNode && n.parentNode.removeChild(n));
+    this._trailNodes = [];
   },
   ripple(x, y, progress) {
     this.ensureOverlay();

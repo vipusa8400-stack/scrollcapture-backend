@@ -1,4 +1,5 @@
 const fs = require("fs");
+const cache = require("./cache");
 
 const FISH_TTS_URL = "https://api.fish.audio/v1/tts";
 const FISH_MODEL_URL = "https://api.fish.audio/model";
@@ -6,6 +7,9 @@ const FISH_MODEL_URL = "https://api.fish.audio/model";
 // Fixed, product-wide voice identity. Never selectable by the user or frontend.
 const DEFAULT_FISH_MODEL = process.env.DEFAULT_FISH_MODEL || "S2.1_PRO";
 const DEFAULT_FISH_VOICE = process.env.DEFAULT_FISH_VOICE || "Sarah";
+// Sarah on s2.1-pro. Used for AI Presentation and AI Cold Outreach alike.
+const DEFAULT_FISH_VOICE_ID =
+  (process.env.DEFAULT_FISH_VOICE_ID || "").trim() || "933563129e564b19a115bedd57b7406a";
 
 const MODEL_HEADERS = {
   S2_1_PRO: "s2.1-pro",
@@ -27,9 +31,8 @@ let cachedVoiceId = null;
 async function resolveVoiceId(apiKey) {
   if (cachedVoiceId !== null) return cachedVoiceId;
 
-  const explicit = (process.env.DEFAULT_FISH_VOICE_ID || "").trim();
-  if (explicit) {
-    cachedVoiceId = explicit;
+  if (DEFAULT_FISH_VOICE_ID) {
+    cachedVoiceId = DEFAULT_FISH_VOICE_ID;
     return cachedVoiceId;
   }
   if (HEX_ID.test(DEFAULT_FISH_VOICE.trim())) {
@@ -112,9 +115,21 @@ async function synthesizeBuffer({ text }) {
 
 /** Synthesizes speech with Fish Audio and writes an mp3 to outputPath. */
 async function synthesizeSpeech({ text, outputPath }) {
-  const buffer = await synthesizeBuffer({ text });
+  // Identical narration lines are only ever synthesized once (retakes are free).
+  const cachePath = await cache.voiceCachePath(text, DEFAULT_FISH_VOICE_ID, DEFAULT_FISH_MODEL);
+  let buffer = await cache.readVoiceCache(cachePath);
+  if (!buffer) {
+    buffer = await synthesizeBuffer({ text });
+    await cache.writeVoiceCache(cachePath, buffer);
+  }
   await fs.promises.writeFile(outputPath, buffer);
   return buffer.length;
 }
 
-module.exports = { synthesizeSpeech, synthesizeBuffer, DEFAULT_FISH_MODEL, DEFAULT_FISH_VOICE };
+module.exports = {
+  synthesizeSpeech,
+  synthesizeBuffer,
+  DEFAULT_FISH_MODEL,
+  DEFAULT_FISH_VOICE,
+  DEFAULT_FISH_VOICE_ID,
+};

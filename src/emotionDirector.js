@@ -106,6 +106,8 @@ function scriptToScenes(script, fallbackScenes = []) {
       selectors,
       expectedDestination,
       speech: speechLines.join("\n").trim(),
+      selector: base.selector || selectors[0] || null,
+      plan: base.plan || null,
     };
   });
 
@@ -129,8 +131,9 @@ async function applyEmotionDirection({ scenes, emotionStyle, language, changes }
     "You are an AI Emotion Director for a text-to-speech voice-over.",
     "You receive presentation scenes and rewrite each 'speech' so it sounds like a real human presenter.",
     `Insert Fish Audio emotion tags on their own line before the sentence they affect. Allowed tags: ${EMOTION_TAGS.map((t) => `[${t}]`).join(", ")}.`,
-    "You may also insert timing tags like [pause:0.8s] between ideas, at most one per scene.",
-    "Never overuse emotions: 1-2 emotion tags per scene, placed where the feeling actually changes.",
+    "Use tags sparingly: at most ONE emotion tag per scene, and only in about half of the scenes.",
+    "Most scenes should have no tag at all. Only tag a scene where the feeling genuinely changes.",
+    "A timing tag like [pause:0.6s] is allowed at most once in the whole script.",
     "Do not translate, do not change the meaning, and do not add new claims about the website.",
     `Emotion style: ${EMOTION_STYLES[style]}`,
     "The first scene should open warmly and the last scene should close with [warm] gratitude.",

@@ -18,17 +18,32 @@ const VALID_STATUSES = new Set([
   "finalizing",
   "rendering",
   "analyzing",
+  "preparing",
+  "mapping",
+  "strategizing",
+  "planning",
   "scripting",
   "voicing",
   "locating",
   "recording",
+  "reviewing",
+  "fixing",
+  "timing",
+  "validating_scenes",
+  "mixing",
+  "quality_check",
+  "cancelled",
+  "interrupted",
   "completed",
   "failed",
 ]);
 
 const jobs = new Map();
+const { lightMap } = require("./websiteMap");
+const jobStore = require("./jobStore");
 const queue = [];
-let processing = false;
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
+let running = 0;
 let worker = null;
 
 function createJob(params, kind = "video") {
@@ -51,12 +66,26 @@ function createJob(params, kind = "video") {
     sceneCount: null,
     script: null,
     scenes: null,
+    websiteMap: null,
+    preparation: null,
+    strategy: null,
+    scenePlan: null,
+    sectionCount: null,
+    sceneTimings: null,
+    sceneReports: null,
+    retryCounts: null,
+    currentScene: null,
+    totalScenes: null,
+    errorCode: null,
+    cancelRequested: false,
+    recovered: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     startedAt: null,
     completedAt: null,
   };
   jobs.set(id, job);
+  jobStore.snapshot(job);
   queue.push(id);
   scheduleNext();
   return job;
@@ -64,6 +93,27 @@ function createJob(params, kind = "video") {
 
 function getJob(id) {
   return jobs.get(id) || null;
+}
+
+function cancelJob(id) {
+  const job = jobs.get(id);
+  if (!job) return null;
+  if (job.status === "completed" || job.status === "failed" || job.status === "cancelled")
+    return job;
+  job.cancelRequested = true;
+  const queuedAt = queue.indexOf(id);
+  if (queuedAt >= 0) {
+    queue.splice(queuedAt, 1);
+    updateJob(id, { status: "cancelled", step: "Cancelled", error: "This job was cancelled." });
+  } else {
+    updateJob(id, { step: "Cancelling…" });
+  }
+  return jobs.get(id);
+}
+
+function isCancelled(id) {
+  const job = jobs.get(id);
+  return Boolean(job && job.cancelRequested);
 }
 
 function publicJob(job) {
@@ -90,6 +140,9 @@ function publicJob(job) {
     step: job.step,
     progress: job.progress,
     error: job.error,
+    errorCode: job.errorCode || null,
+    cancelRequested: Boolean(job.cancelRequested),
+    recovered: Boolean(job.recovered),
     format: job.format,
     fileSize: job.fileSize,
     pageCount: job.pageCount,
@@ -99,6 +152,16 @@ function publicJob(job) {
     sceneCount: job.sceneCount,
     script: job.script,
     scenes: job.scenes,
+    websiteMap: lightMap(job.websiteMap),
+    preparation: job.preparation,
+    strategy: job.strategy,
+    scenePlan: job.scenePlan,
+    sceneTimings: job.sceneTimings,
+    sceneReports: job.sceneReports,
+    retryCounts: job.retryCounts,
+    currentScene: job.currentScene,
+    totalScenes: job.totalScenes,
+    sectionCount: job.sectionCount,
     estimatedSecondsRemaining,
     downloadUrl: job.status === "completed" ? `/api/${base}/${job.id}/download` : null,
     createdAt: job.createdAt,
@@ -113,6 +176,7 @@ function updateJob(id, patch) {
     throw new Error(`invalid status ${patch.status}`);
   }
   Object.assign(job, patch, { updatedAt: Date.now() });
+  jobStore.snapshot(job);
 }
 
 function setWorker(fn) {
@@ -120,29 +184,34 @@ function setWorker(fn) {
 }
 
 function scheduleNext() {
-  if (processing) return;
+  if (running >= MAX_CONCURRENT) return;
   if (!worker) return;
   const next = queue.shift();
   if (!next) return;
   const job = jobs.get(next);
   if (!job) return scheduleNext();
+  if (job.cancelRequested) return scheduleNext();
 
-  processing = true;
+  running += 1;
   job.startedAt = Date.now();
   Promise.resolve()
     .then(() => worker(job))
     .catch((err) => {
-      console.error(`[job ${job.id}] failed`, err);
+      const { friendlyError } = require("./errors");
+      const { code, message } = friendlyError(err, `job ${job.id}`);
       updateJob(job.id, {
-        status: "failed",
-        error: err && err.message ? err.message : String(err),
+        status: job.cancelRequested ? "cancelled" : "failed",
+        step: job.cancelRequested ? "Cancelled" : "Failed",
+        errorCode: code,
+        error: job.cancelRequested ? "This job was cancelled." : message,
       });
     })
     .finally(() => {
-      processing = false;
+      running = Math.max(0, running - 1);
       job.completedAt = Date.now();
       scheduleNext();
     });
+  scheduleNext();
 }
 
 function cleanupExpired() {
@@ -155,6 +224,7 @@ function cleanupExpired() {
         const dir = path.dirname(job.filePath);
         fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
       }
+      jobStore.remove(id);
       jobs.delete(id);
     }
   }
@@ -162,10 +232,40 @@ function cleanupExpired() {
 
 setInterval(cleanupExpired, CLEANUP_INTERVAL_MS).unref?.();
 
+// --- Job recovery -----------------------------------------------------------
+// Snapshots let a restarted backend report what happened to in-flight jobs
+// (and keep completed downloads alive when PERSIST_DIR is a mounted volume).
+function recoverJobs() {
+  if (!jobStore.enabled) return 0;
+  let restored = 0;
+  for (const saved of jobStore.loadAll()) {
+    if (jobs.has(saved.id)) continue;
+    const job = { ...saved, recovered: true, cancelRequested: false };
+    const terminal = job.status === "completed" || job.status === "failed" || job.status === "cancelled";
+    if (!terminal) {
+      job.status = "interrupted";
+      job.step = "Interrupted by a backend restart";
+      job.error = "The rendering worker restarted. Your plan was saved — start the render again.";
+      job.errorCode = "worker_crash";
+    }
+    if (job.status === "completed" && job.filePath && !fs.existsSync(job.filePath)) {
+      job.status = "interrupted";
+      job.error = "The rendered file was removed when the worker restarted.";
+    }
+    jobs.set(job.id, job);
+    restored += 1;
+  }
+  if (restored) console.info(`[jobs] recovered ${restored} persisted job(s)`);
+  return restored;
+}
+
 module.exports = {
   createJob,
   getJob,
   updateJob,
   publicJob,
   setWorker,
+  cancelJob,
+  isCancelled,
+  recoverJobs,
 };

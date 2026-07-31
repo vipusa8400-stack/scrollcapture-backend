@@ -3,13 +3,14 @@ const cors = require("cors");
 const fs = require("fs");
 
 const { validateAndNormalizeUrl } = require("./urlSecurity");
-const { createJob, getJob, publicJob, setWorker } = require("./jobs");
+const { createJob, getJob, publicJob, setWorker, cancelJob, recoverJobs } = require("./jobs");
 const { generateVideo } = require("./videoGenerator");
 const { generateScreenshot } = require("./screenshotGenerator");
 const { generatePdf } = require("./pdfGenerator");
 const { generatePresentation } = require("./presentationGenerator");
 const { generateScenePlan } = require("./aiScript");
-const { fetchPageOutline } = require("./pageOutline");
+const { analyzeWebsite } = require("./websiteAnalysis");
+const { lightMap } = require("./websiteMap");
 const {
   applyEmotionDirection,
   scenesToScript,
@@ -18,6 +19,9 @@ const {
   EMOTION_TAGS,
 } = require("./emotionDirector");
 const { synthesizeBuffer } = require("./fishAudio");
+const { SUBTITLE_MODES } = require("./subtitles");
+const { MUSIC_STYLE_IDS } = require("./music");
+const { friendlyError } = require("./errors");
 
 const ALLOWED_DEVICES = new Set(["desktop", "mobile"]);
 const ALLOWED_RATIOS = new Set(["vertical", "square", "horizontal"]);
@@ -52,6 +56,9 @@ const ALLOWED_MARGINS = new Set(["none", "small", "normal", "large"]);
 const ALLOWED_LANGUAGES = new Set(["en", "ms"]);
 const ALLOWED_TONES = new Set(["professional", "friendly", "premium"]);
 const ALLOWED_EMOTION_STYLES = new Set(EMOTION_STYLE_IDS);
+const ALLOWED_MODES = new Set(["presentation", "outreach"]);
+const ALLOWED_SUBTITLE_MODES = new Set(SUBTITLE_MODES);
+const ALLOWED_MUSIC = new Set(MUSIC_STYLE_IDS);
 
 function bad(res, code, message) {
   return res.status(code).json({ error: "invalid_request", message });
@@ -59,6 +66,7 @@ function bad(res, code, message) {
 
 async function main() {
   const app = express();
+  recoverJobs();
   const allowedOrigin = process.env.ALLOWED_ORIGIN;
   app.use(
     cors({
@@ -88,6 +96,7 @@ async function main() {
       const tone = String(body.tone || "professional");
       const emotionStyle = String(body.emotionStyle || "auto");
       const changes = String(body.changes || "").trim();
+      const mode = ALLOWED_MODES.has(String(body.mode)) ? String(body.mode) : "presentation";
 
       if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
       if (!ALLOWED_LANGUAGES.has(language)) return bad(res, 400, "Invalid language.");
@@ -104,18 +113,24 @@ async function main() {
         return bad(res, 400, err.message);
       }
 
-      // Reuse a previous website analysis when regenerating the script.
-      const pageOutline =
-        Array.isArray(body.pageOutline) && body.pageOutline.length
-          ? body.pageOutline.slice(0, 120).map((s) => String(s).slice(0, 160))
-          : await fetchPageOutline({ websiteUrl, device });
+      // 1. Preparing website  2. Mapping  3. Strategy  4. Scene planning
+      const analysis = await analyzeWebsite({
+        websiteUrl,
+        device,
+        changes,
+        language,
+        tone,
+        mode,
+      });
 
       const plan = await generateScenePlan({
         websiteUrl,
         changes,
         language,
         tone,
-        pageOutline,
+        pageOutline: analysis.pageOutline,
+        strategy: analysis.strategy,
+        scenePlan: analysis.scenePlan,
       });
       const scenes = await applyEmotionDirection({
         scenes: plan.scenes,
@@ -125,7 +140,11 @@ async function main() {
       });
 
       res.json({
-        pageOutline,
+        pageOutline: analysis.pageOutline,
+        websiteMap: lightMap(analysis.websiteMap),
+        preparation: analysis.preparation,
+        strategy: analysis.strategy,
+        scenePlan: analysis.scenePlan,
         scenes,
         script: scenesToScript(scenes),
         emotionTags: EMOTION_TAGS,
@@ -296,6 +315,7 @@ async function main() {
       const tone = String(body.tone || "professional");
       const emotionStyle = String(body.emotionStyle || "auto");
       const changes = String(body.changes || "").trim();
+      const mode = ALLOWED_MODES.has(String(body.mode)) ? String(body.mode) : "presentation";
 
       if (!ALLOWED_DEVICES.has(device)) return bad(res, 400, "Invalid device.");
       if (!ALLOWED_LANGUAGES.has(language)) return bad(res, 400, "Invalid language.");
@@ -310,6 +330,22 @@ async function main() {
         websiteUrl = await validateAndNormalizeUrl(body.websiteUrl);
       } catch (err) {
         return bad(res, 400, err.message);
+      }
+
+      const subtitleMode = ALLOWED_SUBTITLE_MODES.has(String(body.subtitleMode))
+        ? String(body.subtitleMode)
+        : body.subtitles
+          ? "clean"
+          : "off";
+      const music = ALLOWED_MUSIC.has(String(body.music)) ? String(body.music) : "none";
+
+      let existingUrl = null;
+      if (body.existingUrl) {
+        try {
+          existingUrl = await validateAndNormalizeUrl(body.existingUrl);
+        } catch (err) {
+          return bad(res, 400, `Existing website URL: ${err.message}`);
+        }
       }
 
       // An edited/approved emotion script skips the AI scripting step.
@@ -329,8 +365,17 @@ async function main() {
           tone,
           device,
           emotionStyle,
+          mode,
+          strategy: body.strategy && typeof body.strategy === "object" ? body.strategy : null,
+          scenePlan: Array.isArray(body.scenePlan) ? body.scenePlan.slice(0, 8) : null,
           scenes: approvedScenes,
-          subtitles: Boolean(body.subtitles),
+          subtitles: subtitleMode !== "off",
+          subtitleMode,
+          music,
+          existingUrl,
+          showCursor: body.showCursor !== false,
+          clickAnimation: body.clickAnimation !== false,
+          cursorTrail: Boolean(body.cursorTrail),
           format: "mp4",
         },
         "presentation",
@@ -345,6 +390,13 @@ async function main() {
   app.get("/api/presentations/:jobId", (req, res) => {
     const job = getJob(req.params.jobId);
     if (!job || job.kind !== "presentation") return res.status(404).json({ error: "not_found" });
+    res.json(publicJob(job));
+  });
+
+  // Cancel an in-flight presentation job.
+  app.post("/api/presentations/:jobId/cancel", (req, res) => {
+    const job = cancelJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "not_found" });
     res.json(publicJob(job));
   });
 

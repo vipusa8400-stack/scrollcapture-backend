@@ -55,6 +55,7 @@ async function scrollTo(page, shoot, from, to, seconds) {
 
 /** Natural curved cursor travel with acceleration, deceleration and a hover beat. */
 async function moveCursor(page, shoot, state, toX, toY, { seconds = 0.9, hover = 0.25 } = {}) {
+  if (state.cursorEnabled === false) return 0;
   const from = state.cursor || { x: toX - 260, y: toY - 180 };
   const dist = Math.hypot(toX - from.x, toY - from.y);
   const dur = Math.max(0.35, Math.min(seconds, 0.35 + dist / 1400));
@@ -71,8 +72,13 @@ async function moveCursor(page, shoot, state, toX, toY, { seconds = 0.9, hover =
   const cy = my + (ny / norm) * bow;
 
   await page.evaluate(() => window.__scWalkthrough.showCursor(true));
+  await page
+    .evaluate((on) => window.__scWalkthrough.enableTrail(on), Boolean(state.cursorTrail))
+    .catch(() => {});
   for (let f = 0; f < frames; f++) {
-    const t = easeInOut(f / (frames - 1));
+    // Ease-in on departure, strong ease-out so the cursor slows near the target.
+    const raw = f / (frames - 1);
+    const t = easeInOut(raw) * 0.35 + easeOut(raw) * 0.65;
     const inv = 1 - t;
     const x = inv * inv * from.x + 2 * inv * t * cx + t * t * toX;
     const y = inv * inv * from.y + 2 * inv * t * cy + t * t * toY;
@@ -95,17 +101,35 @@ async function moveCursor(page, shoot, state, toX, toY, { seconds = 0.9, hover =
 
 /** Subtle click ripple at the cursor position. */
 async function clickRipple(page, shoot, state, seconds = 0.4) {
+  if (state.cursorEnabled === false || state.clickAnimation === false) return 0;
   const frames = Math.max(2, Math.round(seconds * FPS));
   const { x, y } = state.cursor || { x: 0, y: 0 };
   for (let f = 0; f < frames; f++) {
+    const p = f / (frames - 1);
+    // Click compression: cursor squashes down then springs back.
+    await page
+      .evaluate((amt) => window.__scWalkthrough.setPress(amt), p < 0.35 ? 0.18 : 0)
+      .catch(() => {});
     await page.evaluate(
       ([px, py, p]) => window.__scWalkthrough.ripple(px, py, p),
-      [x, y, f / (frames - 1)],
+      [x, y, p],
     );
     await shoot();
   }
   await page.evaluate(() => window.__scWalkthrough.hideRipple());
+  await page.evaluate(() => window.__scWalkthrough.setPress(0)).catch(() => {});
   return frames / FPS;
+}
+
+/** Move the cursor out of the lower-third before subtitles cover the target. */
+async function parkCursor(page, shoot, state, viewport) {
+  if (state.cursorEnabled === false || !state.cursor) return 0;
+  const safeY = Math.round(viewport.height * 0.22);
+  if (state.cursor.y < viewport.height * 0.72) return 0;
+  return moveCursor(page, shoot, state, Math.round(viewport.width * 0.86), safeY, {
+    seconds: 0.6,
+    hover: 0,
+  });
 }
 
 async function animateZoom(page, shoot, from, to, originX, originY, seconds) {
@@ -137,6 +161,7 @@ module.exports = {
   scrollTo,
   moveCursor,
   clickRipple,
+  parkCursor,
   animateZoom,
   hold,
 };
