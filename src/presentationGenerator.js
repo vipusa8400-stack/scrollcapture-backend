@@ -15,6 +15,8 @@ const { synthesizeSpeech } = require("./fishAudio");
 const { applyEmotionDirection, stripEmotionTags } = require("./emotionDirector");
 const { PAGE_RUNTIME } = require("./pageRuntime");
 const { resolveTarget, remeasure } = require("./sceneTargeting");
+const { sectionFallback } = require("./sceneTargeting");
+const { splitLongScenes, matchSection } = require("./sceneSplitter");
 const { prepareAndMap, buildStrategyAndScenes, outlineFromMap } = require("./websiteAnalysis");
 const { computeFraming, splitShots } = require("./camera");
 const { validateAndFixShot, scoreShot, readChrome } = require("./sceneValidation");
@@ -242,6 +244,17 @@ async function generatePresentation(job) {
       plan.script = plan.scenes.map((s) => s.speech).join("\n\n");
     }
 
+    // A single long scene would keep the camera on the hero for the whole
+    // narration: split it into one scene per section that is actually spoken about.
+    if (plan.scenes.length < 2) {
+      const split = splitLongScenes({ scenes: plan.scenes, websiteMap });
+      if (split.length > plan.scenes.length) {
+        plan.scenes = split;
+        plan.script = plan.scenes.map((s) => s.speech).join("\n\n");
+        updateJob(job.id, { step: `Split narration into ${split.length} scenes` });
+      }
+    }
+
     ensureLive();
     updateJob(job.id, {
       status: "voicing",
@@ -282,6 +295,7 @@ async function generatePresentation(job) {
 
     let timeline = 0;
     const srtParts = [];
+    let lastSceneScrollY = 0;
     const sceneTimings = [];
     const sceneReports = [];
     const scenesDir = path.join(jobRoot, "scenes");
@@ -451,6 +465,41 @@ async function generatePresentation(job) {
       found = shot.found;
       usedFallback = !shot.recordable || found.source === "section" || found.source === "safe_wide";
 
+      // If the exact element could not be resolved, never stay where we are:
+      // move to the mapped section for this scene, otherwise perform a safe
+      // progressive scroll down the page.
+      if (usedFallback) {
+        const chromeFb = await readChrome(page, viewport);
+        const maxScroll = Math.max(0, chromeFb.pageHeight - viewport.height);
+        const section = matchSection(scene, websiteMap);
+        let rect = null;
+        if (section) {
+          const mapped = await resolveTarget(page, {
+            selector: (section.selectorCandidates || [])[0] || null,
+            selectors: section.selectorCandidates || [],
+            target: section.heading || section.type,
+          });
+          rect = (mapped && mapped.rect) || section.boundingBox || null;
+        }
+        if (!rect || !rect.height) {
+          rect = sectionFallback({
+            index: i,
+            total: plan.scenes.length,
+            maxScroll,
+            viewport,
+          }).rect;
+        }
+        found = { rect, selector: null, source: "safe_scroll" };
+        shot.framing = computeFraming({
+          rect,
+          viewport,
+          chrome: chromeFb,
+          framing: { mode: "wide_overview", preferredZoom: 1, minimumPadding: 48 },
+          subtitles,
+          pageHeight: chromeFb.pageHeight,
+        });
+      }
+
       // Plan the shot list (a tall section such as pricing gets two shots so
       // every plan, price and CTA is shown in full).
       const chromeNow = await readChrome(page, viewport);
@@ -502,8 +551,19 @@ async function generatePresentation(job) {
           pageHeight: chromeShot.pageHeight,
         });
 
+        // Guarantee forward motion: a fallback scene must never re-shoot the
+        // exact same viewport as the previous scene.
+        if (s === 0 && i > 0 && usedFallback && Math.abs(framing.scrollY - lastSceneScrollY) < 40) {
+          const maxScroll = Math.max(0, chromeShot.pageHeight - viewport.height);
+          framing.scrollY = Math.min(
+            maxScroll,
+            lastSceneScrollY + Math.round(viewport.height * 0.85),
+          );
+        }
+
         const move = await scrollTo(page, shoot, cameraY, framing.scrollY, s === 0 ? SCROLL_SECONDS : 0.7);
         cameraY = framing.scrollY;
+        lastSceneScrollY = cameraY;
         if (!leadCounted) lead += move;
         else held += move;
 

@@ -40,14 +40,29 @@ function scrollTargetFor(rect, viewport, metrics) {
 }
 
 async function scrollTo(page, shoot, from, to, seconds) {
+  const applyScroll = async (y) => {
+    await page.evaluate((sy) => {
+      window.scrollTo(0, sy);
+      // Some sites scroll an inner container instead of the window.
+      if (Math.abs(window.scrollY - sy) > 4) {
+        const els = Array.from(document.querySelectorAll('body, body > *, main, #root, #__next'));
+        for (const el of els) {
+          if (el.scrollHeight > el.clientHeight + 40) {
+            el.scrollTop = sy;
+            break;
+          }
+        }
+      }
+    }, y);
+  };
   if (Math.abs(to - from) < 2) {
-    await page.evaluate((y) => window.scrollTo(0, y), to);
+    await applyScroll(to);
     return 0;
   }
   const frames = Math.max(2, Math.round(seconds * FPS));
   for (let f = 0; f < frames; f++) {
     const y = Math.round(from + (to - from) * easeInOut(f / (frames - 1)));
-    await page.evaluate((sy) => window.scrollTo(0, sy), y);
+    await applyScroll(y);
     await shoot();
   }
   return frames / FPS;
